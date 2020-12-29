@@ -139,6 +139,11 @@ async function main() {
     {}
   );
 
+  if (argv.packages?.length ?? 0 === 0) {
+    console.log("Packages must be specified.");
+    exit(1);
+  }
+
   const mainPackages = silent(() => filterPackages(packages, argv.packages));
   const ignoredPackages =
     argv.ignore?.length ?? 0 > 0
