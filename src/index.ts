@@ -139,8 +139,6 @@ async function main() {
     {}
   );
 
-  console.log(argv);
-
   if ((argv.packages?.length ?? 0) === 0) {
     console.log("Packages must be specified.");
     exit(1);
