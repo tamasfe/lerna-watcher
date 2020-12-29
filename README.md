@@ -1,9 +1,8 @@
 An unofficial watcher for [Lerna](https://github.com/lerna/lerna), similar to [lerna-watch](https://github.com/mattstyles/lerna-watch).
 
-It was made for personal use in mind, so don't expect quality code or proper maintenance or every edge case being handled.
-Feel free to use/fork it, or PRs are welcome.
+It was made with personal use in mind, but feel free to use/fork it, or PRs are welcome.
 
-**The tool uses internal Lerna APIs so it might break anytime.**
+**The tool uses internal Lerna APIs and although unlikely, it might break anytime.**
 
 ## Installation
 
