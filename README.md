@@ -40,7 +40,7 @@ Apart from the command line options, additional configuration can be done in `le
 
 Here are the defaults with some explanation in the comments:
 
-```json
+```json5
 // lerna.json
 {
   // ...
