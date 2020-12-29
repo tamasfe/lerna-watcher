@@ -55,7 +55,7 @@ export interface LernaConfig {
   npmClient?: "yarn" | "npm";
   useWorkspaces?: boolean;
   version?: string | "independent";
-  watch?: WatchConfig;
+  watcher?: WatchConfig;
 }
 
 export interface WatchConfig {
@@ -76,7 +76,7 @@ export interface WatchConfig {
      *
      * The names support wildcards.
      */
-    named?: { [key: string]: PackageWatchConfig };
+    patterns?: { [key: string]: PackageWatchConfig };
   };
 }
 
@@ -192,14 +192,14 @@ async function main() {
 
     if (commands.length === 0) {
       if (isDependency) {
-        log.warn(
+        log.verbose(
           "dependency",
-          `missing or invalid dependency commands for package "${packageName}"`
+          `missing dependency commands for package "${packageName}"`
         );
       } else {
         log.error(
           "invalid config",
-          `missing or invalid commands for package "${packageName}"`
+          `missing commands for package "${packageName}"`
         );
         exit(1);
       }
@@ -350,7 +350,8 @@ async function main() {
     // Done twice for nicer logging.
     for (const dep of graph.get(packageName).localDependencies) {
       const depName = dep[1].name;
-      if (ignoredPackagesMap[depName]) {
+      const depCfg = getPackageWatchConfig(watchConfig, depName);
+      if (ignoredPackagesMap[depName] || depCfg.ignore) {
         log.notice("dependency", `(ignored) "${packageName}" => "${depName}"`);
         continue;
       }
@@ -392,6 +393,7 @@ function defaultWatchConfig(): WatchConfig {
     exitOnError: false,
     packages: {
       default: {
+        ignore: false,
         continueOnError: false,
         exclude: [
           "**/node_modules/**",
@@ -402,9 +404,9 @@ function defaultWatchConfig(): WatchConfig {
         ],
         include: ["**"],
         commands: ["dev"],
-        dependencyCommands: ["build"],
+        dependencyCommands: [],
       },
-      named: {},
+      patterns: {},
     },
   };
 }
@@ -412,28 +414,17 @@ function defaultWatchConfig(): WatchConfig {
 function createWatchConfig(config?: LernaConfig): WatchConfig {
   const watchConfig: WatchConfig = deepmerge(
     defaultWatchConfig(),
-    config.watch ?? {}
+    config.watcher ?? {}
   );
 
-  for (const packageName of Object.keys(watchConfig.packages.named)) {
-    const named = watchConfig.packages.named[packageName];
-
-    if (typeof named.include === "undefined") {
-      named.include = watchConfig.packages.default.include;
-    }
-
-    if (typeof named.exclude === "undefined") {
-      named.exclude = watchConfig.packages.default.exclude;
-    }
-
-    if (typeof named.commands === "undefined") {
-      named.commands = watchConfig.packages.default.commands;
-    }
-
-    if (typeof named.dependencyCommands === "undefined") {
-      named.dependencyCommands =
-        watchConfig.packages.default.dependencyCommands;
-    }
+  for (const packageName of Object.keys(watchConfig.packages.patterns)) {
+    watchConfig.packages.patterns[packageName] = deepmerge(
+      watchConfig.packages.default,
+      watchConfig.packages.patterns[packageName],
+      {
+        arrayMerge: (_target, source) => source,
+      }
+    );
   }
 
   return watchConfig;
@@ -443,15 +434,26 @@ function getPackageWatchConfig(
   watchConfig: WatchConfig,
   name: string
 ): PackageWatchConfig {
-  if (watchConfig.packages.named) {
-    for (const pattern of Object.keys(watchConfig.packages.named)) {
+  let foundPattern = undefined;
+  let found = undefined;
+  if (watchConfig.packages.patterns) {
+    for (const pattern of Object.keys(watchConfig.packages.patterns)) {
       if (isMatch(name, pattern)) {
-        return watchConfig.packages.named[pattern];
+        if (typeof found !== "undefined") {
+          log.error(
+            "invalid config",
+            `multiple matches found for package "${name}": "${foundPattern}" and "${pattern}"`
+          );
+          exit(1);
+        }
+
+        found = watchConfig.packages.patterns[pattern];
+        foundPattern = pattern;
       }
     }
   }
 
-  return watchConfig.packages!.default;
+  return found ?? watchConfig.packages!.default;
 }
 
 function asyncProcess(child: ChildProcess): Promise<number> {
