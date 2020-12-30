@@ -13,6 +13,10 @@ import { ChildProcess, spawn } from "child_process";
 import AsyncLock from "async-lock";
 import path from "path";
 import { isMatch } from "matcher";
+import { dir } from "tmp-promise";
+import crypto, { BinaryLike } from "crypto";
+import fs from "fs/promises";
+import fsSync from "fs";
 
 export interface PackageWatchConfig {
   /**
@@ -188,7 +192,10 @@ async function main() {
     new Map()
   );
 
-  function watchPackage(p: Package, dependents: DependentCallback[] = []) {
+  async function watchPackage(
+    p: Package,
+    dependents: DependentCallback[] = []
+  ) {
     const packageName: string = (p as any).name;
     log.info("watch", packageName);
 
@@ -348,12 +355,39 @@ async function main() {
       ignored: packageCfg.exclude,
     });
 
+    const tmpDir = await dir();
+    process.once("exit", () =>
+      fs.rm(tmpDir.path, { recursive: true, force: true })
+    );
+
     watcher.once("ready", () => {
       if (!isDependency && argv.run) {
         executeDebounced();
       }
 
-      ["add", "addDir", "change", "unlink", "unlinkDir"].forEach(event =>
+      // Change is special, we have to keep track of file contents,
+      // as some tools will update the file even if nothing has changed
+      // resulting in endless loops.
+      watcher.on("change", async p => {
+        log.verbose("event", "change", p);
+        const pathHash = hash(p);
+        const tmpFilePath = path.join(tmpDir.path, pathHash);
+
+        try {
+          const oldContentHash = await fs.readFile(tmpFilePath, "utf-8");
+          const newContentHash = hash(await fs.readFile(p));
+
+          await fs.writeFile(tmpFilePath, newContentHash, "utf-8");
+          if (oldContentHash !== newContentHash) {
+            executeDebounced();
+          }
+        } catch (e) {
+          await fs.writeFile(tmpFilePath, hash(await fs.readFile(p)), "utf-8");
+          executeDebounced();
+        }
+      });
+
+      ["add", "addDir", "unlink", "unlinkDir"].forEach(event =>
         watcher.on(event, e => {
           log.verbose("event", event, e);
           executeDebounced();
@@ -484,4 +518,8 @@ type DependentCallback = () => any;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function hash(content: string | BinaryLike): string {
+  return crypto.createHash("sha256").update(content).digest("hex");
 }
