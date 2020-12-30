@@ -23,6 +23,7 @@ import fs from "fs/promises";
 import fsOld, { FSWatcher } from "fs";
 import { tmpdir } from "os";
 
+
 export interface PackageWatchConfig {
   /**
    * The commands to run for the main watched packages.
@@ -183,7 +184,7 @@ async function main() {
       : [];
 
   if (mainPackages.length === 0) {
-    log.error("watch", "no packages found.");
+    getLog().error("watch", "no packages found.");
     exit(1);
   }
 
@@ -278,12 +279,12 @@ class PackageWatch {
 
     if (this.commands.length === 0) {
       if (this.isDependency) {
-        log.verbose(
+        getLog().verbose(
           "dependency",
           `missing dependency commands for package "${this.name}"`
         );
       } else {
-        log.error(
+        getLog().error(
           "invalid config",
           `missing commands for package "${this.name}"`
         );
@@ -304,10 +305,10 @@ class PackageWatch {
       );
 
       if (PackageWatch.options.ignoredPackages[depName] || depCfg.ignore) {
-        log.notice("dependency", `(ignored) "${this.name}" => "${depName}"`);
+        getLog().notice("dependency", `(ignored) "${this.name}" => "${depName}"`);
         continue;
       }
-      log.notice("dependency", `"${this.name}" => "${depName}"`);
+      getLog().notice("dependency", `"${this.name}" => "${depName}"`);
       toWatch.push(depName);
     }
 
@@ -341,14 +342,14 @@ class PackageWatch {
       await sleep(50);
 
       if (this.cancelled) {
-        log.silly("run", `cancelled run for package "${this.name}"`);
+        getLog().silly("run", `cancelled run for package "${this.name}"`);
         return;
       }
 
       const { argv } = PackageWatch.options;
 
       if (argv.bootstrap) {
-        log.info("run", `bootstrap for for package "${this.name}"`);
+        getLog().info("run", `bootstrap for for package "${this.name}"`);
         this.process = spawn(
           "./node_modules/.bin/lerna",
           [
@@ -369,14 +370,14 @@ class PackageWatch {
 
       for (const command of this.commands) {
         if (this.cancelled) {
-          log.silly(
+          getLog().silly(
             "run",
             `cancelled command "${command}" for package "${this.name}"`
           );
           return;
         }
 
-        log.info("run", `command "${command}" for package "${this.name}"`);
+        getLog().info("run", `command "${command}" for package "${this.name}"`);
 
         this.process = spawn(
           "./node_modules/.bin/lerna",
@@ -400,13 +401,13 @@ class PackageWatch {
 
         if (!this.cancelled && exitCode !== 0) {
           if (PackageWatch.options.watchConfig.exitOnError) {
-            log.error(
+            getLog().error(
               "run",
               `command "${command}" failed for package "${this.name}"`
             );
             exit(1);
           } else {
-            log.warn(
+            getLog().warn(
               "run",
               `command "${command}" failed for package "${this.name}"`
             );
@@ -415,7 +416,7 @@ class PackageWatch {
             }
           }
         } else {
-          log.info(
+          getLog().info(
             "run",
             `command "${command}" finished for package "${this.name}"`
           );
@@ -427,7 +428,7 @@ class PackageWatch {
           if (afterCommands) {
             (async () => {
               for (const command of afterCommands) {
-                log.info(
+                getLog().info(
                   "run",
                   `additional command "${command}" for package "${pkgName}"`
                 );
@@ -483,12 +484,12 @@ class PackageWatch {
 
   private watchPaths() {
     if (this.watchConfig!.include!.length === 0) {
-      log.warn("watch", `no watch paths given for package "${this.name}"`);
+      getLog().warn("watch", `no watch paths given for package "${this.name}"`);
     }
 
     const executeDebounced = debounce((firstRun?: boolean) => {
       if (!firstRun) {
-        log.info("changed", this.name);
+        getLog().info("changed", this.name);
       }
       this.execute();
     }, 500);
@@ -497,12 +498,12 @@ class PackageWatch {
       path.normalize(`${this.lernaPackage.location}/${inc}`)
     );
 
-    log.verbose("watch", watchPaths as any);
+    getLog().verbose("watch", watchPaths as any);
 
     let pWatcher = this.getWatcher();
 
     if (!pWatcher) {
-      log.info("watch", this.name);
+      getLog().info("watch", this.name);
       pWatcher = {
         watcher: chokidar.watch(watchPaths, {
           ignored: this.watchConfig.exclude,
@@ -530,7 +531,7 @@ class PackageWatch {
       // as some tools will update the file even if nothing has changed
       // resulting in endless loops.
       pWatcher!.watcher!.on("change", async p => {
-        log.verbose("event", "change", p);
+        getLog().verbose("event", "change", p);
         const pathHash = hash(p);
 
         const tmpFilePath = path.join(tmpDirPath, pathHash);
@@ -551,7 +552,7 @@ class PackageWatch {
 
       ["add", "addDir", "unlink", "unlinkDir"].forEach(event =>
         pWatcher!.watcher.on(event, (p: string) => {
-          log.verbose("event", event, p);
+          getLog().verbose("event", event, p);
           pWatcher!.callbacks.forEach(cb => cb());
         })
       );
@@ -647,7 +648,7 @@ function getPackageWatchConfig(
     for (const pattern of Object.keys(watchConfig.packages.patterns)) {
       if (isMatch(name, pattern)) {
         if (typeof found !== "undefined") {
-          log.error(
+          getLog().error(
             "invalid config",
             `multiple matches found for package "${name}": "${foundPattern}" and "${pattern}"`
           );
@@ -677,3 +678,9 @@ function sleep(ms: number): Promise<void> {
 function hash(content: string | BinaryLike): string {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
+
+function getLog(): typeof log {
+  log.heading = "watcher";
+  return log;
+}
+
