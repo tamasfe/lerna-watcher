@@ -428,7 +428,10 @@ function defaultWatchConfig(): WatchConfig {
 function createWatchConfig(config?: LernaConfig): WatchConfig {
   const watchConfig: WatchConfig = deepmerge(
     defaultWatchConfig(),
-    config.watcher ?? {}
+    config.watcher ?? {},
+    {
+      arrayMerge: (_target, source) => source,
+    }
   );
 
   for (const packageName of Object.keys(watchConfig.packages.patterns)) {
