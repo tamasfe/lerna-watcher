@@ -114,6 +114,11 @@ async function main() {
           default: false,
           description: `Run Lerna "bootstrap" before running commands for a package.`,
         })
+        .option("run", {
+          type: "boolean",
+          default: false,
+          description: `Run the commands of the watched main packages at startup.`,
+        })
         .demandOption("packages", "Packages are required.");
     })
     .option("loglevel", {
@@ -344,6 +349,10 @@ async function main() {
     });
 
     watcher.once("ready", () => {
+      if (!isDependency && argv.run) {
+        executeDebounced();
+      }
+
       ["add", "addDir", "change", "unlink", "unlinkDir"].forEach(event =>
         watcher.on(event, e => {
           log.verbose("event", event, e);
