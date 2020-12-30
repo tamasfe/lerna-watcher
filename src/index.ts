@@ -1,9 +1,14 @@
 import log from "npmlog";
+// @ts-ignore
 import Project from "@lerna/project";
+// @ts-ignore
 import PackageGraph from "@lerna/package-graph";
+// @ts-ignore
 import Package from "@lerna/package";
 import yargs from "yargs/yargs";
+// @ts-ignore
 import yargsHelpers from "yargs/helpers";
+// @ts-ignore
 import filterLernaPackages from "@lerna/filter-packages";
 import deepmerge from "deepmerge";
 import { exit } from "process";
@@ -13,10 +18,10 @@ import { ChildProcess, spawn } from "child_process";
 import AsyncLock from "async-lock";
 import path from "path";
 import { isMatch } from "matcher";
-import { dir } from "tmp-promise";
 import crypto, { BinaryLike } from "crypto";
 import fs from "fs/promises";
-import fsSync from "fs";
+import fsOld, { FSWatcher } from "fs";
+import { tmpdir } from "os";
 
 export interface PackageWatchConfig {
   /**
@@ -37,6 +42,15 @@ export interface PackageWatchConfig {
    * The commands are run in order.
    */
   dependencyCommands?: Array<string>;
+
+  /**
+   * Additional commands to run after a specified command.
+   *
+   * These are always run in a fire and forget manner.
+   *
+   * Useful for lints and tests.
+   */
+  runAfter?: Record<string, Array<string>>;
 
   /**
    * A list of glob patterns.
@@ -63,6 +77,10 @@ export interface LernaConfig {
 }
 
 export interface WatchConfig {
+  /**
+   * Whether to clear cache on exit.
+   */
+  clearCache?: boolean;
   /**
    * Whether to stop watching if a script fails.
    */
@@ -121,7 +139,12 @@ async function main() {
         .option("run", {
           type: "boolean",
           default: false,
-          description: `Run the commands of the watched main packages at startup.`,
+          description: `Run the commands of the watched main packages at startup, this is ignored if "--run-all" is used.`,
+        })
+        .option("run-all", {
+          type: "boolean",
+          default: false,
+          description: `Run the commands of all the packages (including dependencies) at startup.`,
         })
         .demandOption("packages", "Packages are required.");
     })
@@ -144,7 +167,7 @@ async function main() {
 
   const packages = await project.getPackages();
   const packagesMap: Record<string, Package> = packages.reduce(
-    (all, p) => ({ ...all, [(p as any).name]: p }),
+    (all: any, p: any) => ({ ...all, [(p as any).name]: p }),
     {}
   );
 
@@ -169,209 +192,348 @@ async function main() {
     {}
   );
 
-  const graph = new PackageGraph(
+  const packageGraph = new PackageGraph(
     packages,
     argv.dev ? "allDependencies" : "dependencies",
     true
   );
 
-  graph.collapseCycles(true);
+  packageGraph.collapseCycles(true);
 
-  const packageLock = new AsyncLock();
+  const tmpDir = path.join(tmpdir(), "lerna-watch");
 
-  interface PackageProcess {
-    process?: ChildProcess;
-    cancelled: boolean;
+  fsOld.mkdirSync(tmpDir, { recursive: true });
+  if (watchConfig.clearCache) {
+    process.once("exit", () => {
+      fsOld.rmSync(tmpDir, { recursive: true, force: true });
+    });
   }
 
-  const packageProcesses: Map<string, PackageProcess> = packages.reduce(
-    (map, p) => {
-      map.set(p.name, { cancelled: false, process: undefined });
-      return map;
-    },
-    new Map()
-  );
+  PackageWatch.options = {
+    watchConfig,
+    tmpDir,
+    ignoredPackages: ignoredPackagesMap,
+    packages: packagesMap,
+    argv,
+    packageGraph,
+  };
 
-  async function watchPackage(
-    p: Package,
-    dependents: DependentCallback[] = []
+  mainPackages.forEach(p => new PackageWatch(p));
+}
+main();
+
+interface PackageWatchGlobalOptions {
+  watchConfig: WatchConfig;
+  argv: any;
+  tmpDir: string;
+  packageGraph: PackageGraph;
+  ignoredPackages: Record<string, Package>;
+  packages: Record<string, Package>;
+}
+
+interface PackageFsWatcher {
+  watcher: FSWatcher;
+  callbacks: Array<(firstRun?: boolean) => void>;
+  isReady: boolean;
+}
+
+class PackageWatch {
+  public static options: PackageWatchGlobalOptions;
+
+  private static lock = new AsyncLock();
+  private static all: Record<string, PackageWatch> = {};
+  private static watchers: Record<string, PackageFsWatcher> = {};
+
+  private _name: string;
+
+  public get name() {
+    return this._name;
+  }
+
+  private isDependency: boolean;
+  private commands: string[];
+  private watchConfig: PackageWatchConfig;
+  private tmpDirPath: string;
+  private dependencyCount: number = 0;
+
+  private process?: ChildProcess;
+  private cancelled: boolean = false;
+
+  constructor(
+    private lernaPackage: Package,
+    private dependents: PackageWatch[] = []
   ) {
-    const packageName: string = (p as any).name;
-    log.info("watch", packageName);
+    this._name = lernaPackage.name;
+    this.isDependency = dependents.length !== 0;
+    this.tmpDirPath = PackageWatch.options.tmpDir;
 
-    const packageCfg = getPackageWatchConfig(watchConfig, packageName);
+    this.watchConfig = getPackageWatchConfig(
+      PackageWatch.options.watchConfig,
+      this.name
+    );
 
-    const isDependency = dependents.length !== 0;
+    this.commands = this.isDependency
+      ? this.watchConfig.dependencyCommands ?? []
+      : this.watchConfig.commands ?? [];
 
-    const commands = isDependency
-      ? packageCfg.dependencyCommands ?? []
-      : packageCfg.commands ?? [];
-
-    if (commands.length === 0) {
-      if (isDependency) {
+    if (this.commands.length === 0) {
+      if (this.isDependency) {
         log.verbose(
           "dependency",
-          `missing dependency commands for package "${packageName}"`
+          `missing dependency commands for package "${this.name}"`
         );
       } else {
         log.error(
           "invalid config",
-          `missing commands for package "${packageName}"`
+          `missing commands for package "${this.name}"`
         );
         exit(1);
       }
     }
 
-    const includePaths = packageCfg.include;
+    PackageWatch.all[this.name] = this;
 
-    if (includePaths.length === 0) {
-      log.warn("watch", `no paths given for package "${packageName}"`);
+    const toWatch: string[] = [];
+
+    for (const dep of PackageWatch.options.packageGraph.get(this.name)
+      .localDependencies) {
+      const depName = dep[1].name;
+      const depCfg = getPackageWatchConfig(
+        PackageWatch.options.watchConfig,
+        depName
+      );
+
+      if (PackageWatch.options.ignoredPackages[depName] || depCfg.ignore) {
+        log.notice("dependency", `(ignored) "${this.name}" => "${depName}"`);
+        continue;
+      }
+      log.notice("dependency", `"${this.name}" => "${depName}"`);
+      toWatch.push(depName);
     }
 
-    async function execute() {
-      const current = packageProcesses.get(packageName);
+    this.dependencyCount = toWatch.length;
 
-      if (packageLock.isBusy(packageName)) {
-        current.cancelled = true;
-        current.process?.kill("SIGTERM");
+    this.watchPaths();
+
+    toWatch.forEach(
+      name =>
+        new PackageWatch(PackageWatch.options.packages[name], [
+          ...this.dependents,
+          this,
+        ])
+    );
+  }
+
+  public async execute() {
+    if (PackageWatch.lock.isBusy(this.name)) {
+      this.cancel();
+    }
+
+    await PackageWatch.lock.acquire(this.name, async () => {
+      // In case there were any pending processes.
+      this.cancel();
+
+      this.cancelled = false;
+
+      // To allow cancellation without
+      // starting processes in case of
+      // multiple fast invocations.
+      await sleep(50);
+
+      if (this.cancelled) {
+        log.silly("run", `cancelled run for package "${this.name}"`);
+        return;
       }
 
-      await packageLock.acquire(packageName, async () => {
-        current.cancelled = false;
-        current.process?.kill();
-        current.process = undefined;
+      const { argv } = PackageWatch.options;
 
-        // To allow cancellation without
-        // starting processes in case of
-        // multiple fast invocations.
-        await sleep(50);
+      if (argv.bootstrap) {
+        log.info("run", `bootstrap for for package "${this.name}"`);
+        this.process = spawn(
+          "./node_modules/.bin/lerna",
+          [
+            "bootstrap",
+            "--exclude-dependents",
+            "--scope",
+            this.name,
+            ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
+              ? ["--loglevel", argv.loglevel]
+              : ["--loglevel", "warn"]),
+          ],
+          {
+            stdio: "inherit",
+          }
+        );
+        await asyncProcess(this.process);
+      }
 
-        if (current.cancelled) {
-          log.silly("run", `cancelled run for package "${packageName}"`);
+      for (const command of this.commands) {
+        if (this.cancelled) {
+          log.silly(
+            "run",
+            `cancelled command "${command}" for package "${this.name}"`
+          );
           return;
         }
 
-        if (argv.bootstrap) {
-          log.info("run", `bootstrap for for package "${packageName}"`);
-          current.process = spawn(
-            "./node_modules/.bin/lerna",
-            [
-              "bootstrap",
-              "--exclude-dependents",
-              "--scope",
-              packageName,
-              ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
-                ? ["--loglevel", argv.loglevel]
-                : ["--loglevel", "warn"]),
-            ],
-            {
-              stdio: "inherit",
-            }
-          );
-          await asyncProcess(current.process);
-        }
+        log.info("run", `command "${command}" for package "${this.name}"`);
 
-        for (const command of commands) {
-          if (current.cancelled) {
-            log.silly(
-              "run",
-              `cancelled command "${command}" for package "${packageName}"`
-            );
-            return;
+        this.process = spawn(
+          "./node_modules/.bin/lerna",
+          [
+            "run",
+            command,
+            "--scope",
+            this.name,
+            ...(argv.stream ? ["--stream"] : []),
+            ...(argv.noPrefix ? ["--no-prefix"] : []),
+            ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
+              ? ["--loglevel", argv.loglevel]
+              : ["--loglevel", "warn"]),
+          ],
+          {
+            stdio: "inherit",
           }
+        );
 
-          log.info("run", `command "${command}" for package "${packageName}"`);
+        const exitCode = await asyncProcess(this.process);
 
-          current.process = spawn(
-            "./node_modules/.bin/lerna",
-            [
+        if (!this.cancelled && exitCode !== 0) {
+          if (PackageWatch.options.watchConfig.exitOnError) {
+            log.error(
               "run",
-              command,
-              "--scope",
-              packageName,
-              ...(argv.stream ? ["--stream"] : []),
-              ...(argv.noPrefix ? ["--no-prefix"] : []),
-              ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
-                ? ["--loglevel", argv.loglevel]
-                : ["--loglevel", "warn"]),
-            ],
-            {
-              stdio: "inherit",
-            }
-          );
-
-          const exitCode = await asyncProcess(current.process);
-
-          if (!current.cancelled && exitCode !== 0) {
-            if (watchConfig.exitOnError) {
-              log.error(
-                "run",
-                `command "${command}" failed for package "${packageName}"`
-              );
-              exit(1);
-            } else {
-              log.warn(
-                "run",
-                `command "${command}" failed for package "${packageName}"`
-              );
-              if (!packageCfg.continueOnError) {
-                break;
-              }
-            }
+              `command "${command}" failed for package "${this.name}"`
+            );
+            exit(1);
           } else {
-            log.info(
+            log.warn(
               "run",
-              `command "${command}" finished for package "${packageName}"`
+              `command "${command}" failed for package "${this.name}"`
             );
+            if (!this.watchConfig.continueOnError) {
+              break;
+            }
           }
+        } else {
+          log.info(
+            "run",
+            `command "${command}" finished for package "${this.name}"`
+          );
 
-          if (current.cancelled) {
-            log.silly(
-              "run",
-              `cancelled command "${command}" for package "${packageName}"`
-            );
-            return;
+          const afterCommands = this.watchConfig.runAfter?.[command];
+
+          const pkgName = this.name;
+
+          if (afterCommands) {
+            (async () => {
+              for (const command of afterCommands) {
+                log.info(
+                  "run",
+                  `additional command "${command}" for package "${pkgName}"`
+                );
+                const child = spawn(
+                  "./node_modules/.bin/lerna",
+                  [
+                    "run",
+                    command,
+                    "--scope",
+                    pkgName,
+                    ...(argv.stream ? ["--stream"] : []),
+                    ...(argv.noPrefix ? ["--no-prefix"] : []),
+                    ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
+                      ? ["--loglevel", argv.loglevel]
+                      : ["--loglevel", "warn"]),
+                  ],
+                  {
+                    stdio: "inherit",
+                  }
+                );
+
+                const onExit = () => {
+                  if (!child.killed) {
+                    child.kill();
+                  }
+                };
+
+                process.on("exit", onExit);
+                child.on("exit", () => process.off("exit", onExit));
+
+                await asyncProcess(child);
+              }
+            })();
           }
         }
-      });
-
-      for (const dependentCallback of dependents.slice().reverse()) {
-        dependentCallback();
       }
-    }
-
-    const executeDebounced = debounce(() => {
-      log.info("changed", packageName);
-      execute();
-    }, 500);
-
-    const watchPaths = includePaths.map(inc =>
-      path.normalize(`${(p as any).location}/${inc}`)
-    );
-
-    log.verbose("watching", watchPaths as any);
-
-    const watcher = chokidar.watch(watchPaths, {
-      ignored: packageCfg.exclude,
     });
 
-    const tmpDir = await dir();
-    process.once("exit", () =>
-      fs.rm(tmpDir.path, { recursive: true, force: true })
+    // We make sure to run dependents after this package in case
+    // this was cancelled by another watch.
+    await PackageWatch.lock.acquire(this.name, async () => {});
+
+    for (const dependent of this.dependents.slice().reverse()) {
+      dependent.execute();
+    }
+  }
+
+  private cancel() {
+    this.cancelled = true;
+    this.process?.kill();
+    this.process = undefined;
+  }
+
+  private watchPaths() {
+    if (this.watchConfig!.include!.length === 0) {
+      log.warn("watch", `no watch paths given for package "${this.name}"`);
+    }
+
+    const executeDebounced = debounce((firstRun?: boolean) => {
+      if (!firstRun) {
+        log.info("changed", this.name);
+      }
+      this.execute();
+    }, 500);
+
+    const watchPaths = this.watchConfig!.include!.map(inc =>
+      path.normalize(`${this.lernaPackage.location}/${inc}`)
     );
 
-    watcher.once("ready", () => {
-      if (!isDependency && argv.run) {
-        executeDebounced();
+    log.verbose("watch", watchPaths as any);
+
+    let pWatcher = this.getWatcher();
+
+    if (!pWatcher) {
+      log.info("watch", this.name);
+      pWatcher = {
+        watcher: chokidar.watch(watchPaths, {
+          ignored: this.watchConfig.exclude,
+        }),
+        callbacks: [],
+        isReady: false,
+      };
+      this.setWatcher(pWatcher);
+    }
+
+    pWatcher.callbacks.push(executeDebounced);
+
+    const setupWatch = () => {
+      // Start execution on leaf packages
+      if (PackageWatch.options.argv.runAll && this.dependencyCount === 0) {
+        pWatcher!.callbacks.forEach(cb => cb(true));
+        // Otherwise run on only the roots
+      } else if (PackageWatch.options.argv.run && !this.isDependency) {
+        pWatcher!.callbacks.forEach(cb => cb(true));
       }
+
+      const tmpDirPath = this.tmpDirPath;
 
       // Change is special, we have to keep track of file contents,
       // as some tools will update the file even if nothing has changed
       // resulting in endless loops.
-      watcher.on("change", async p => {
+      pWatcher!.watcher!.on("change", async p => {
         log.verbose("event", "change", p);
         const pathHash = hash(p);
-        const tmpFilePath = path.join(tmpDir.path, pathHash);
+
+        const tmpFilePath = path.join(tmpDirPath, pathHash);
 
         try {
           const oldContentHash = await fs.readFile(tmpFilePath, "utf-8");
@@ -379,46 +541,39 @@ async function main() {
 
           await fs.writeFile(tmpFilePath, newContentHash, "utf-8");
           if (oldContentHash !== newContentHash) {
-            executeDebounced();
+            pWatcher!.callbacks.forEach(cb => cb());
           }
         } catch (e) {
           await fs.writeFile(tmpFilePath, hash(await fs.readFile(p)), "utf-8");
-          executeDebounced();
+          pWatcher!.callbacks.forEach(cb => cb());
         }
       });
 
       ["add", "addDir", "unlink", "unlinkDir"].forEach(event =>
-        watcher.on(event, e => {
-          log.verbose("event", event, e);
-          executeDebounced();
+        pWatcher!.watcher.on(event, (p: string) => {
+          log.verbose("event", event, p);
+          pWatcher!.callbacks.forEach(cb => cb());
         })
       );
-    });
+    };
 
-    // Done twice for nicer logging.
-    for (const dep of graph.get(packageName).localDependencies) {
-      const depName = dep[1].name;
-      const depCfg = getPackageWatchConfig(watchConfig, depName);
-      if (ignoredPackagesMap[depName] || depCfg.ignore) {
-        log.notice("dependency", `(ignored) "${packageName}" => "${depName}"`);
-        continue;
-      }
-      log.notice("dependency", `"${packageName}" => "${depName}"`);
-    }
-
-    for (const dep of graph.get(packageName).localDependencies) {
-      const depName = dep[1].name;
-      if (ignoredPackagesMap[depName]) {
-        continue;
-      }
-      watchPackage(packagesMap[depName], [...dependents, execute]);
+    if (pWatcher.isReady) {
+      setupWatch();
+    } else {
+      pWatcher.watcher.once("ready", setupWatch);
     }
   }
 
-  mainPackages.forEach(p => watchPackage(p, []));
-}
+  private getWatcher(): PackageFsWatcher | undefined {
+    if (PackageWatch.watchers[this.name]) {
+      return PackageWatch.watchers[this.name];
+    }
+  }
 
-main();
+  private setWatcher(watcher: PackageFsWatcher) {
+    PackageWatch.watchers[this.name] = watcher;
+  }
+}
 
 function filterPackages(
   packages: Package[],
@@ -451,8 +606,9 @@ function defaultWatchConfig(): WatchConfig {
           ".*/**",
         ],
         include: ["**"],
-        commands: ["dev"],
+        commands: [],
         dependencyCommands: [],
+        runAfter: {},
       },
       patterns: {},
     },
@@ -462,18 +618,18 @@ function defaultWatchConfig(): WatchConfig {
 function createWatchConfig(config?: LernaConfig): WatchConfig {
   const watchConfig: WatchConfig = deepmerge(
     defaultWatchConfig(),
-    config.watcher ?? {},
+    config?.watcher ?? {},
     {
-      arrayMerge: (_target, source) => source,
+      arrayMerge: (_target: any, source: any) => source,
     }
   );
 
-  for (const packageName of Object.keys(watchConfig.packages.patterns)) {
-    watchConfig.packages.patterns[packageName] = deepmerge(
-      watchConfig.packages.default,
-      watchConfig.packages.patterns[packageName],
+  for (const packageName of Object.keys(watchConfig.packages!.patterns!)) {
+    watchConfig.packages!.patterns![packageName] = deepmerge(
+      watchConfig.packages!.default!,
+      watchConfig.packages!.patterns![packageName],
       {
-        arrayMerge: (_target, source) => source,
+        arrayMerge: (_target: any, source: any) => source,
       }
     );
   }
@@ -487,7 +643,7 @@ function getPackageWatchConfig(
 ): PackageWatchConfig {
   let foundPattern = undefined;
   let found = undefined;
-  if (watchConfig.packages.patterns) {
+  if (watchConfig.packages?.patterns) {
     for (const pattern of Object.keys(watchConfig.packages.patterns)) {
       if (isMatch(name, pattern)) {
         if (typeof found !== "undefined") {
@@ -504,7 +660,7 @@ function getPackageWatchConfig(
     }
   }
 
-  return found ?? watchConfig.packages!.default;
+  return found ?? watchConfig.packages!.default!;
 }
 
 function asyncProcess(child: ChildProcess): Promise<number> {
@@ -513,8 +669,6 @@ function asyncProcess(child: ChildProcess): Promise<number> {
     child.addListener("exit", resolve);
   });
 }
-
-type DependentCallback = () => any;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));

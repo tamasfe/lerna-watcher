@@ -1,6 +1,6 @@
 {
   "name": "lerna-watcher",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "An opinionated watcher tool for Lerna.",
   "repository": {
     "type": "git",
@@ -36,7 +36,6 @@
     "lerna": "^3.22.1",
     "lodash.debounce": "^4.0.8",
     "matcher": "^3.0.0",
-    "tmp-promise": "^3.0.2",
     "yargs": "^16.2.0"
   }
 }
