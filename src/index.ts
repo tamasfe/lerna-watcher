@@ -11,7 +11,7 @@ import yargsHelpers from "yargs/helpers";
 // @ts-ignore
 import filterLernaPackages from "@lerna/filter-packages";
 import deepmerge from "deepmerge";
-import { exit } from "process";
+import { exit, stdout } from "process";
 import chokidar from "chokidar";
 import debounce from "lodash.debounce";
 import { ChildProcess, spawn } from "child_process";
@@ -126,10 +126,15 @@ async function main() {
           default: false,
           description: `Same as Lerna's "--stream" option`,
         })
-        .option("no-prefix", {
+        .option("prefix", {
           type: "boolean",
-          default: false,
-          description: `Same as Lerna's "--no-prefix" option`,
+          default: true,
+          description: `Use "--no-prefix" to pass it to Lerna`,
+        })
+        .option("output", {
+          type: "boolean",
+          default: true,
+          description: `Use "--no-output" to suppress all output from Lerna unless an error happens.`,
         })
         .option("bootstrap", {
           type: "boolean",
@@ -241,7 +246,7 @@ class PackageWatch {
   public static options: PackageWatchGlobalOptions;
 
   private static lock = new AsyncLock();
-  private static all: Record<string, PackageWatch> = {};
+  private static all: Array<PackageWatch> = [];
   private static watchers: Record<string, PackageFsWatcher> = {};
 
   private _name: string;
@@ -257,7 +262,9 @@ class PackageWatch {
   private dependencyCount: number = 0;
 
   private process?: ChildProcess;
-  private cancelled: boolean = false;
+
+  private runId: number = 0;
+  private runCancelled: Record<number, boolean> = {};
 
   constructor(
     private lernaPackage: Package,
@@ -291,7 +298,7 @@ class PackageWatch {
       }
     }
 
-    PackageWatch.all[this.name] = this;
+    PackageWatch.all.push(this);
 
     const toWatch: string[] = [];
 
@@ -333,22 +340,20 @@ class PackageWatch {
       return;
     }
 
-    if (PackageWatch.lock.isBusy(this.name)) {
-      this.cancel();
-    }
+    this.cancel();
+
+    const runId = this.runId;
+    this.runCancelled[runId] = false;
+
+    this.runId++;
 
     await PackageWatch.lock.acquire(this.name, async () => {
-      // In case there were any pending processes.
-      this.cancel();
-
-      this.cancelled = false;
-
       // To allow cancellation without
       // starting processes in case of
       // multiple fast invocations.
       await sleep(50);
 
-      if (this.cancelled) {
+      if (this.cancelled(runId)) {
         getLog().silly("run", `cancelled run for package "${this.name}"`);
         return;
       }
@@ -356,8 +361,8 @@ class PackageWatch {
       const { argv } = PackageWatch.options;
 
       if (argv.bootstrap) {
-        getLog().info("run", `bootstrap for for package "${this.name}"`);
-        this.process = spawn(
+        getLog().info("bootstrap", this.name);
+        const p = spawn(
           "./node_modules/.bin/lerna",
           [
             "bootstrap",
@@ -369,14 +374,25 @@ class PackageWatch {
               : ["--loglevel", "warn"]),
           ],
           {
-            stdio: "inherit",
+            stdio: !argv.output ? "pipe" : "inherit",
           }
         );
-        await asyncProcess(this.process);
+        this.process = p;
+
+        const outputChunks: Uint8Array[] = [];
+        if (!argv.output) {
+          p.stdout?.on("data", chunk => outputChunks.push(chunk));
+        }
+
+        const code = await asyncProcess(this.process);
+
+        if (!argv.output && code !== 0) {
+          process.stdout.write(Buffer.concat(outputChunks).toString("utf-8"));
+        }
       }
 
       for (const command of this.commands) {
-        if (this.cancelled) {
+        if (this.cancelled(runId)) {
           getLog().silly(
             "run",
             `cancelled command "${command}" for package "${this.name}"`
@@ -384,7 +400,7 @@ class PackageWatch {
           return;
         }
 
-        getLog().info("run", `command "${command}" for package "${this.name}"`);
+        getLog().info("run", `${this.name}: ${command}`);
 
         this.process = spawn(
           "./node_modules/.bin/lerna",
@@ -394,19 +410,24 @@ class PackageWatch {
             "--scope",
             this.name,
             ...(argv.stream ? ["--stream"] : []),
-            ...(argv.noPrefix ? ["--no-prefix"] : []),
+            ...(!argv.prefix ? ["--no-prefix"] : []),
             ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
               ? ["--loglevel", argv.loglevel]
               : ["--loglevel", "warn"]),
           ],
           {
-            stdio: "inherit",
+            stdio: !argv.output ? "pipe" : "inherit",
           }
         );
 
+        const outputChunks: Uint8Array[] = [];
+        if (!argv.output) {
+          this.process.stdout?.on("data", chunk => outputChunks.push(chunk));
+        }
+
         const exitCode = await asyncProcess(this.process);
 
-        if (!this.cancelled && exitCode !== 0) {
+        if (!this.cancelled(runId) && exitCode !== 0) {
           if (PackageWatch.options.watchConfig.exitOnError) {
             getLog().error(
               "run",
@@ -414,19 +435,39 @@ class PackageWatch {
             );
             exit(1);
           } else {
-            getLog().warn(
-              "run",
-              `command "${command}" failed for package "${this.name}"`
-            );
+            getLog().warn("run", `${this.name}: ${command} failed`);
+
+            if (!argv.output) {
+              process.stdout.write(
+                Buffer.concat(outputChunks).toString("utf-8")
+              );
+            }
+
             if (!this.watchConfig.continueOnError) {
               break;
             }
           }
+
+          if (this.cancelled(runId)) {
+            getLog().silly(
+              "run",
+              `cancelled command "${command}" for package "${this.name}"`
+            );
+            return;
+          }
         } else {
-          getLog().info(
+          getLog().verbose(
             "run",
             `command "${command}" finished for package "${this.name}"`
           );
+
+          if (this.cancelled(runId)) {
+            getLog().silly(
+              "run",
+              `cancelled command "${command}" for package "${this.name}"`
+            );
+            return;
+          }
 
           const afterCommands = this.watchConfig.runAfter?.[command];
 
@@ -434,28 +475,34 @@ class PackageWatch {
 
           if (afterCommands) {
             (async () => {
-              for (const command of afterCommands) {
+              for (const afterCommand of afterCommands) {
                 getLog().info(
                   "run",
-                  `additional command "${command}" for package "${pkgName}"`
+                  `${pkgName}: ${afterCommand} (after ${command})`
                 );
+
                 const child = spawn(
                   "./node_modules/.bin/lerna",
                   [
                     "run",
-                    command,
+                    afterCommand,
                     "--scope",
                     pkgName,
                     ...(argv.stream ? ["--stream"] : []),
-                    ...(argv.noPrefix ? ["--no-prefix"] : []),
+                    ...(!argv.prefix ? ["--no-prefix"] : []),
                     ...(argv.loglevel === "verbose" || argv.loglevel === "silly"
                       ? ["--loglevel", argv.loglevel]
                       : ["--loglevel", "warn"]),
                   ],
                   {
-                    stdio: "inherit",
+                    stdio: !argv.output ? "pipe" : "inherit",
                   }
                 );
+
+                const outputChunks: Uint8Array[] = [];
+                if (!argv.output) {
+                  child.stdout?.on("data", chunk => outputChunks.push(chunk));
+                }
 
                 const onExit = () => {
                   if (!child.killed) {
@@ -466,7 +513,13 @@ class PackageWatch {
                 process.on("exit", onExit);
                 child.on("exit", () => process.off("exit", onExit));
 
-                await asyncProcess(child);
+                const code = await asyncProcess(child);
+
+                if (!argv.output && code !== 0) {
+                  process.stdout.write(
+                    Buffer.concat(outputChunks).toString("utf-8")
+                  );
+                }
               }
             })();
           }
@@ -483,10 +536,29 @@ class PackageWatch {
     }
   }
 
-  private cancel() {
-    this.cancelled = true;
+  private cancel(external?: boolean) {
     this.process?.kill();
     this.process = undefined;
+
+    Object.keys(this.runCancelled).forEach(k => {
+      this.runCancelled[k as any] = true;
+    });
+
+    if (!external) {
+      PackageWatch.all
+        .filter(p => p.name === this.name && p !== this)
+        .forEach(p => p.cancel(true));
+    }
+  }
+
+  private cancelled(id: number) {
+    const cancelled = this.runCancelled[id];
+
+    if (cancelled) {
+      delete this.runCancelled[id];
+    }
+
+    return cancelled;
   }
 
   private watchPaths() {
