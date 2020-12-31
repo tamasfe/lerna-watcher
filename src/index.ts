@@ -11,7 +11,7 @@ import yargsHelpers from "yargs/helpers";
 // @ts-ignore
 import filterLernaPackages from "@lerna/filter-packages";
 import deepmerge from "deepmerge";
-import { exit, stdout } from "process";
+import { exit } from "process";
 import chokidar from "chokidar";
 import debounce from "lodash.debounce";
 import { ChildProcess, spawn } from "child_process";
@@ -351,7 +351,7 @@ class PackageWatch {
       // To allow cancellation without
       // starting processes in case of
       // multiple fast invocations.
-      await sleep(50);
+      await sleep(20);
 
       if (this.cancelled(runId)) {
         getLog().silly("run", `cancelled run for package "${this.name}"`);
@@ -572,7 +572,7 @@ class PackageWatch {
         getLog().info("change", this.name);
       }
       this.execute();
-    }, 500);
+    }, 100);
 
     let pWatcher = this.getWatcher();
 

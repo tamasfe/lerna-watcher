@@ -105,7 +105,7 @@ Here are the defaults with some explanation in the comments:
       },
       // Configuration for package names by wildcard patterns.
       //
-      // All package must match exactly one pattern.
+      // All packages must match exactly one pattern.
       "patterns": {
         // All the properties are the same as in "default".
         //

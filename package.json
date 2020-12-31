@@ -1,6 +1,6 @@
 {
   "name": "lerna-watcher",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "An opinionated watcher tool for Lerna.",
   "repository": {
     "type": "git",
