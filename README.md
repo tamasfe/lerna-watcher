@@ -79,7 +79,7 @@ Here are the defaults with some explanation in the comments:
         // The commands (npm/yarn scripts) to run on change.
         // These are executed in order.
         //
-        // This list must never be empty.
+        // This list must never be empty for the main watch targets.
         "commands": ["dev"],
         // Alternatively, these commands are run when the package is
         // a dependency, "commands" and "dependencyCommands" are completely

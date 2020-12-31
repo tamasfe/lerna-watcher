@@ -23,7 +23,6 @@ import fs from "fs/promises";
 import fsOld, { FSWatcher } from "fs";
 import { tmpdir } from "os";
 
-
 export interface PackageWatchConfig {
   /**
    * The commands to run for the main watched packages.
@@ -305,7 +304,10 @@ class PackageWatch {
       );
 
       if (PackageWatch.options.ignoredPackages[depName] || depCfg.ignore) {
-        getLog().notice("dependency", `(ignored) "${this.name}" => "${depName}"`);
+        getLog().notice(
+          "dependency",
+          `"${this.name}" => "${depName}" (ignored)`
+        );
         continue;
       }
       getLog().notice("dependency", `"${this.name}" => "${depName}"`);
@@ -326,6 +328,11 @@ class PackageWatch {
   }
 
   public async execute() {
+    if (this.commands.length === 0) {
+      getLog().verbose("watch", `skipping ${this.name} (no commands to run)`);
+      return;
+    }
+
     if (PackageWatch.lock.isBusy(this.name)) {
       this.cancel();
     }
@@ -483,16 +490,35 @@ class PackageWatch {
   }
 
   private watchPaths() {
-    if (this.watchConfig!.include!.length === 0) {
-      getLog().warn("watch", `no watch paths given for package "${this.name}"`);
+    if (this.commands.length === 0) {
+      getLog().info("skip", `${this.name} (no commands to run)`);
+      return;
     }
 
     const executeDebounced = debounce((firstRun?: boolean) => {
       if (!firstRun) {
-        getLog().info("changed", this.name);
+        getLog().info("change", this.name);
       }
       this.execute();
     }, 500);
+
+    let pWatcher = this.getWatcher();
+
+    const initialRun = () => {
+      // Start execution on leaf packages
+      if (PackageWatch.options.argv.runAll && this.dependencyCount === 0) {
+        pWatcher!.callbacks.forEach(cb => cb(true));
+        // Otherwise run on only the roots
+      } else if (PackageWatch.options.argv.run && !this.isDependency) {
+        pWatcher!.callbacks.forEach(cb => cb(true));
+      }
+    };
+
+    if ((this.watchConfig?.include?.length ?? 0) === 0) {
+      getLog().warn("watch", `no watch paths given for package "${this.name}"`);
+      getLog().info("watch", `skipping ${this.name}`);
+      return;
+    }
 
     const watchPaths = this.watchConfig!.include!.map(inc =>
       path.normalize(`${this.lernaPackage.location}/${inc}`)
@@ -500,10 +526,11 @@ class PackageWatch {
 
     getLog().verbose("watch", watchPaths as any);
 
-    let pWatcher = this.getWatcher();
-
     if (!pWatcher) {
-      getLog().info("watch", this.name);
+      getLog().info(
+        "watch",
+        `${this.name} (${this.commands.join(" >> ") ?? ""})`
+      );
       pWatcher = {
         watcher: chokidar.watch(watchPaths, {
           ignored: this.watchConfig.exclude,
@@ -517,13 +544,7 @@ class PackageWatch {
     pWatcher.callbacks.push(executeDebounced);
 
     const setupWatch = () => {
-      // Start execution on leaf packages
-      if (PackageWatch.options.argv.runAll && this.dependencyCount === 0) {
-        pWatcher!.callbacks.forEach(cb => cb(true));
-        // Otherwise run on only the roots
-      } else if (PackageWatch.options.argv.run && !this.isDependency) {
-        pWatcher!.callbacks.forEach(cb => cb(true));
-      }
+      initialRun();
 
       const tmpDirPath = this.tmpDirPath;
 
@@ -683,4 +704,3 @@ function getLog(): typeof log {
   log.heading = "watcher";
   return log;
 }
-
