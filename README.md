@@ -1,3 +1,5 @@
+**disclaimer**: I don't use nor maintain this tool anymore, use it at your own risk. Maintainers and contributions are still welcome though.
+
 An unofficial watcher for [Lerna](https://github.com/lerna/lerna), similar to [lerna-watch](https://github.com/mattstyles/lerna-watch).
 
 It was made with personal use in mind, but feel free to use/fork it, PRs are also welcome.
